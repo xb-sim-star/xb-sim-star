@@ -1,0 +1,175 @@
+#ifndef _STAGE_LINEAR_${layer_num}
+#define _STAGE_LINEAR_${layer_num}
+
+#include "../${crossbar_file}"
+#include "systemc.h"
+#include "../ADC.h"
+#include "../DAC.h"
+#include <omp.h>
+
+using namespace std;
+
+SC_MODULE(stage_linear_${layer_num}) {
+	sc_in<float> *input; //[${input_size}];
+	sc_out<float> *output; //[${output_size}];
+	sc_in<int> signal_in;
+	sc_in<bool> clock_2; // for XB computation
+	sc_out<int> signal_out;
+
+	float *input_buff;
+	float *ad_buff;
+	bool start;
+
+	// read crossbar data from file
+	void init_crossbar() {
+		float* cell = new float[${crossbar_l}*${crossbar_w}];
+		string filename = "./weights/weight_${layer_num}.csv";
+{	        
+                FILE * input;
+                input = fopen( filename.c_str(), "rb" );
+                int ret = fread(cell,sizeof(float ), ${crossbar_l}*${crossbar_w} ,input);
+                if (ret <0 )
+                {
+                        std::cout << "fread fail\n";
+                        return ;
+                }
+                fclose( input);       
+}
+
+
+        // copy layer ${layer_num} weight matrix to entire_cb weight matrix
+/*
+        int start_pos = ${length_offset}*ENTIRE_W+${width_offset};
+        for (int i = 0; i < ${crossbar_l}; i++) {
+            memcpy(entire_cb.CB_cell+start_pos+i*ENTIRE_W, cell+i*${crossbar_w}, ${crossbar_w}*sizeof(float));
+        }
+*/	memcpy(entire_cb.CB_cell[ ${layer_num} ], cell, ${crossbar_l}*${crossbar_w} * sizeof(float) );
+
+		delete[] cell;
+		cout << "load weights ${layer_num} complete. "  << filename << endl;
+		input_buff = new float[${input_size}]();
+		ad_buff = new float[${crossbar_w}]();
+		input = new sc_in<float>[${input_size}]();
+		output = new sc_out<float>[${output_size}]();
+		start = false;
+	}
+
+	// activation function default relu
+	void activation(float tmp[]) {
+		for (int i = 0; i < ${output_size}; i++)
+			if (tmp[i] < 0.0)
+				tmp[i] = 0.0;
+	}
+
+	// read data from last buffer layer and compose them to the crossbar entire input
+	void stage_linear_run() {
+
+extern int linear_comp_num;
+extern int layer_comp_who[LAYER + 1]; //// 15 conv and 4 linear crossbar total 
+linear_comp_num ++;
+layer_comp_who[ ${layer_num} ] = 1;
+
+	    start = true;
+
+		// with ad & da
+		memset(input_buff, 0, sizeof(float)*${input_size});
+		float _max = 0.0;
+		for (int i = 0; i < ${input_size}; ++i){
+			input_buff[i] = input[i].read();
+			if (input_buff[i] > _max)
+				_max = input_buff[i];
+		}
+
+		// for movement
+		int move = 0;
+		for (int i = 0; i < DA_WIDTH; ++i){
+			move += int(pow(2, double(i)));
+		}
+
+		// scale input
+		int n = 14;
+		if (n > AD_WIDTH){
+			float para = pow(2, AD_WIDTH-n);
+			for (int i = 0; i < ${input_size}; ++i){
+				input_buff[i] = int(input_buff[i] * para);
+                if (input_buff[i] > 255)
+                    input_buff[i] = 255;
+			}
+		}
+
+		// DA->XB
+//		da dac(DA_V);
+        float *tmp_input = new float[${input_size}]();
+        for (int i = 0; i < AD_WIDTH/DA_WIDTH; ++i){
+            // lower da_width bits
+            for (int j = 0; j < ${input_size}; ++j){
+                int bitnum = static_cast<int>(int(input_buff[j]) & move);
+//                dac.trans(bitnum, DA_WIDTH);
+                tmp_input[j] = float(bitnum);
+                input_buff[j] = input_buff[j] / pow(2, DA_WIDTH);
+            }
+/*
+            memcpy(entire_cb.input + ENTIRE_L * i + ${length_offset} + ${crossbar_l} - ${input_size},
+                   tmp_input, sizeof(float) * ${input_size});
+*/	    memcpy(entire_cb.input[ ${layer_num} ] + i * ${crossbar_l} + ${crossbar_l} - ${input_size}, 
+		tmp_input, sizeof(float) * ${input_size} );
+        }
+        delete []tmp_input;
+	}
+
+	// read data from crossbar and send them to next buffer layer
+	void crossbar_computation(){
+	    // XB->AD
+	    if (start) {
+            ad adc(AD_V);
+            memset(ad_buff, 0, sizeof(float)*${crossbar_w});
+            float *tmp_output = new float[${crossbar_w}]();
+            for (int i = 0; i < AD_WIDTH/DA_WIDTH; ++i) {
+/*
+                memcpy(tmp_output, entire_cb.output + ENTIRE_W * i + ${width_offset},
+                        sizeof(float) * ${crossbar_w});
+*/		memcpy(tmp_output, entire_cb.output[ ${layer_num} ] + i * ${crossbar_w}, sizeof(float) * ${crossbar_w} );
+                // ad and shift add
+                for (int j = 0; j < ${crossbar_w}; ++j) {
+                    float tmp = tmp_output[j] / XB${layer_num}_I;
+                    if (tmp > 1)
+                        adc.trans(1.0);
+                    else if (tmp < -1)
+                        adc.trans(-1.0);
+                    else
+                        adc.trans(tmp);
+                    int tmp_ad = int(adc.AD_out);
+                    ad_buff[j] = (tmp_ad) * pow(2, i) + ad_buff[j];
+                }
+            }
+            delete []tmp_output;
+            activation(ad_buff);
+            for (int i = 0; i < ${output_size}; i++) {
+                output[i].write(ad_buff[i]);
+            }
+            signal_out.write(signal_in.read());
+            start = false;
+        }
+	}
+
+	SC_CTOR(stage_linear_${layer_num}) {
+		init_crossbar();
+
+		SC_METHOD(stage_linear_run);
+		sensitive << signal_in;
+		dont_initialize();
+
+		SC_METHOD(crossbar_computation);
+		sensitive << clock_2.pos();
+		dont_initialize();
+	}
+
+	~stage_linear_${layer_num}() {
+		delete []input_buff;
+		delete []ad_buff;
+		delete []input;
+		delete []output;
+	}
+};
+
+#endif // !_STAGE_LINEAR_${layer_num}
